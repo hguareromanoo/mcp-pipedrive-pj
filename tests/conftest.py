@@ -106,12 +106,63 @@ def sample_deal_fields_response():
         # Native varchar_options
         {
             "key": "lost_reason",
-            "name": "Motivo da Perda",
+            "name": "Motivo da perda",
             "field_type": "varchar_options",
             "options": [
                 {"id": 15, "label": "Budget"},
                 {"id": 20, "label": "Timing"},
                 {"id": 22, "label": "Falha no Contato"},
+            ],
+        },
+        # Custom enum — Hunter
+        {
+            "key": "hunter_hash",
+            "name": "Hunter",
+            "field_type": "enum",
+            "options": [
+                {"id": 500, "label": "Hunter A"},
+                {"id": 501, "label": "Hunter B"},
+            ],
+        },
+        # Custom enum — SDR
+        {
+            "key": "sdr_hash",
+            "name": "SDR",
+            "field_type": "enum",
+            "options": [
+                {"id": 600, "label": "SDR A"},
+                {"id": 601, "label": "SDR B"},
+            ],
+        },
+        # Custom enum — Número de Funcionários
+        {
+            "key": "0b2be49fb7615b170878d944a7cb05f6ec8f9e27",
+            "name": "Número de Funcionários",
+            "field_type": "enum",
+            "options": [
+                {"id": 184, "label": "11-50"},
+                {"id": 185, "label": "51-200"},
+                {"id": 186, "label": "201-500"},
+            ],
+        },
+        # Native enum — Origem
+        {
+            "key": "origin",
+            "name": "Origem",
+            "field_type": "enum",
+            "options": [
+                {"id": 1, "label": "Site"},
+                {"id": 2, "label": "Indicação"},
+            ],
+        },
+        # Custom enum — Suborigem
+        {
+            "key": "suborigem_hash",
+            "name": "Suborigem",
+            "field_type": "enum",
+            "options": [
+                {"id": 10, "label": "Form LP"},
+                {"id": 11, "label": "Email"},
             ],
         },
         # Native built-ins (no options)

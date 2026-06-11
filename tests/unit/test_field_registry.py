@@ -252,7 +252,7 @@ async def test_field_key_resolves_known_name(mock_registry):
 async def test_field_key_resolves_native_name(mock_registry):
     """Native fields use their native key (not a hash)."""
     assert mock_registry.field_key("deal", "Etiqueta") == "label"
-    assert mock_registry.field_key("deal", "Motivo da Perda") == "lost_reason"
+    assert mock_registry.field_key("deal", "Motivo da perda") == "lost_reason"
     assert mock_registry.field_key("deal", "Stage") == "stage_id"
 
 

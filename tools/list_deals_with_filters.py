@@ -55,12 +55,24 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         portfolio: list[str] | None = None,
         canal: str | None = None,
         setor: str | None = None,
+        funcionarios: list[str] | None = None,
+        origem: str | None = None,
+        suborigem: str | None = None,
         cn_name: str | None = None,
+        hunter: str | None = None,
+        sdr: str | None = None,
         stage: str | None = None,
         pipeline: str | None = None,
         status: Literal["open", "won", "lost", "deleted", "all_not_deleted"] = "all_not_deleted",
+        motivo_perda: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        won_start_date: str | None = None,
+        won_end_date: str | None = None,
+        lost_start_date: str | None = None,
+        lost_end_date: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
         include_fields: list[str] | None = None,
         limit: int = 100,
     ) -> list[dict]:
@@ -81,11 +93,22 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             portfolio: List of portfolio names (e.g. ["NDados - DSaaS"]); deal must match at least one.
             canal: One of "Inbound", "Outbound", "Fidelização", "Indicação".
             setor: Setor da Empresa display name (e.g. "Information Technology & Services").
+            funcionarios: List of company-size buckets (e.g. ["201-500", "501-1,000"]); deal must match at least one.
+            origem: Origem display name (top-level lead source).
+            suborigem: Suborigem display name (drill-down of origem).
             cn_name: Owner display name (resolved to user_id internally).
+            hunter: Hunter display name (custom enum field — prospector).
+            sdr: SDR display name (custom enum field — qualifier).
             stage: Stage display name (e.g. "AT Marcada").
             pipeline: Pipeline display name (e.g. "Funil Comercial").
             status: "open" | "won" | "lost" | "deleted" | "all_not_deleted" (default).
+            motivo_perda: Loss reason display name (e.g. "Budget"). Requires status="lost".
             start_date / end_date: ISO YYYY-MM-DD; filter by deal add_time.
+            won_start_date / won_end_date: ISO YYYY-MM-DD; filter by won_time
+                (when deal was won). Deals without won_time are excluded.
+            lost_start_date / lost_end_date: ISO YYYY-MM-DD; filter by lost_time
+                (when deal was lost). Deals without lost_time are excluded.
+            min_value / max_value: Filter by deal value (BRL). Deals without value are excluded.
             include_fields: Subset of fields per deal. Default returns 11 enxuto keys
                 (id, title, value, currency, stage_name, pipeline_name, owner_name,
                 status, label_names, add_time, update_time). To see custom fields
@@ -105,9 +128,21 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         portfolio_option_ids: list[int] = []
         canal_option_id: int | None = None
         setor_option_id: int | None = None
+        funcionarios_option_ids: list[int] = []
+        origem_option_id: int | None = None
+        suborigem_option_id: int | None = None
         owner_id: int | None = None
+        hunter_option_id: int | None = None
+        sdr_option_id: int | None = None
+        motivo_perda_option_id: int | None = None
         pipeline_id_int: int | None = None
         stage_id_int: int | None = None
+
+        if motivo_perda is not None and status != "lost":
+            raise ValueError(
+                "motivo_perda só é válido quando status='lost'. "
+                f"Status atual: {status!r}."
+            )
 
         try:
             if nucleo is not None:
@@ -120,8 +155,25 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
                 canal_option_id = registry.option_id("deal", "Canal de Entrada", canal)
             if setor is not None:
                 setor_option_id = registry.option_id("deal", "Setor da Empresa", setor)
+            if funcionarios is not None:
+                funcionarios_option_ids = [
+                    registry.option_id("deal", "Número de Funcionários", f)
+                    for f in funcionarios
+                ]
+            if origem is not None:
+                origem_option_id = registry.option_id("deal", "Origem", origem)
+            if suborigem is not None:
+                suborigem_option_id = registry.option_id("deal", "Suborigem", suborigem)
             if cn_name is not None:
                 owner_id = registry.user_id_by_name(cn_name)
+            if hunter is not None:
+                hunter_option_id = registry.option_id("deal", "Hunter", hunter)
+            if sdr is not None:
+                sdr_option_id = registry.option_id("deal", "SDR", sdr)
+            if motivo_perda is not None:
+                motivo_perda_option_id = registry.option_id(
+                    "deal", "Motivo da perda", motivo_perda
+                )
             if pipeline is not None:
                 pipeline_id_int = None
                 for pid, pname in registry._pipelines.items():
@@ -162,7 +214,13 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         # Without custom filters, we can stop as soon as we have `limit` deals.
         has_post_filter = any(
             f is not None
-            for f in (nucleo, portfolio, canal, setor, start_date, end_date)
+            for f in (
+                nucleo, portfolio, canal, setor, funcionarios, origem, suborigem,
+                hunter, sdr, motivo_perda,
+                start_date, end_date,
+                won_start_date, won_end_date, lost_start_date, lost_end_date,
+                min_value, max_value,
+            )
         )
         fetch_target = limit * 5 if has_post_filter else limit
 
@@ -193,7 +251,23 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         canal_key = registry.field_key("deal", "Canal de Entrada") if canal is not None else None
         setor_key = registry.field_key("deal", "Setor da Empresa") if setor is not None else None
         portfolio_key = registry.field_key("deal", "Portfólio") if portfolio is not None else None
+        funcionarios_key = registry.field_key("deal", "Número de Funcionários") if funcionarios is not None else None
+        origem_key = registry.field_key("deal", "Origem") if origem is not None else None
+        suborigem_key = registry.field_key("deal", "Suborigem") if suborigem is not None else None
+        hunter_key = registry.field_key("deal", "Hunter") if hunter is not None else None
+        sdr_key = registry.field_key("deal", "SDR") if sdr is not None else None
+        motivo_perda_key = registry.field_key("deal", "Motivo da perda") if motivo_perda is not None else None
         label_key = "label"
+
+        def _in_date_window(ts: Any, start: str | None, end: str | None) -> bool:
+            if not ts:
+                return False
+            d = str(ts)[:10]
+            if start is not None and d < start:
+                return False
+            if end is not None and d > end:
+                return False
+            return True
 
         def matches(deal: dict) -> bool:
             if nucleo is not None:
@@ -210,17 +284,47 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             if setor is not None and setor_key is not None:
                 if _to_int(deal.get(setor_key)) != setor_option_id:
                     return False
+            if funcionarios is not None and funcionarios_key is not None:
+                if _to_int(deal.get(funcionarios_key)) not in set(funcionarios_option_ids):
+                    return False
+            if origem is not None and origem_key is not None:
+                if _to_int(deal.get(origem_key)) != origem_option_id:
+                    return False
+            if suborigem is not None and suborigem_key is not None:
+                if _to_int(deal.get(suborigem_key)) != suborigem_option_id:
+                    return False
+            if hunter is not None and hunter_key is not None:
+                if _to_int(deal.get(hunter_key)) != hunter_option_id:
+                    return False
+            if sdr is not None and sdr_key is not None:
+                if _to_int(deal.get(sdr_key)) != sdr_option_id:
+                    return False
+            if motivo_perda is not None and motivo_perda_key is not None:
+                if _to_int(deal.get(motivo_perda_key)) != motivo_perda_option_id:
+                    return False
             # Pipedrive's /v1/deals start_date/end_date filter by update_time,
             # not add_time. The tool's contract is "filter by add_time", so we
             # apply the date window in memory.
             if start_date is not None or end_date is not None:
-                add_time = deal.get("add_time")
-                if not add_time:
+                if not _in_date_window(deal.get("add_time"), start_date, end_date):
                     return False
-                deal_date = str(add_time)[:10]
-                if start_date is not None and deal_date < start_date:
+            if won_start_date is not None or won_end_date is not None:
+                if not _in_date_window(deal.get("won_time"), won_start_date, won_end_date):
                     return False
-                if end_date is not None and deal_date > end_date:
+            if lost_start_date is not None or lost_end_date is not None:
+                if not _in_date_window(deal.get("lost_time"), lost_start_date, lost_end_date):
+                    return False
+            if min_value is not None or max_value is not None:
+                v = deal.get("value")
+                if v is None or v == "":
+                    return False
+                try:
+                    vf = float(v)
+                except (TypeError, ValueError):
+                    return False
+                if min_value is not None and vf < min_value:
+                    return False
+                if max_value is not None and vf > max_value:
                     return False
             return True
 
