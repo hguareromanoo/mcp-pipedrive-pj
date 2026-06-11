@@ -49,6 +49,14 @@ def _make_deal(
     setor_id: int = 167,  # IT & Services
     add_time: str = "2026-05-01 10:00:00",
     update_time: str = "2026-06-01 12:00:00",
+    won_time: str | None = None,
+    lost_time: str | None = None,
+    lost_reason_id: int | None = None,
+    hunter_id: int | None = None,
+    sdr_id: int | None = None,
+    funcionarios_id: int | None = None,
+    origem_id: int | None = None,
+    suborigem_id: int | None = None,
 ) -> dict:
     """Build a Pipedrive deal dict mirroring the real API response shape."""
     return {
@@ -64,11 +72,18 @@ def _make_deal(
         "label": label,
         "add_time": add_time,
         "update_time": update_time,
+        "won_time": won_time,
+        "lost_time": lost_time,
         "97d0502cc2b489986844a93b374656e5acf179e1": canal_id,
         "e4339ab04542dcd1e1215e4bc17ee2bcf45a9652": portfolio_csv,
         "6ea1ea74da5fbb8cb6a8dd741a96a9bc8b4e379f": setor_id,
         "ede9bf995bb2d7e50ea8ffbfd24cb56e72232ff0": None,
-        "lost_reason": None,
+        "lost_reason": lost_reason_id,
+        "hunter_hash": hunter_id,
+        "sdr_hash": sdr_id,
+        "0b2be49fb7615b170878d944a7cb05f6ec8f9e27": funcionarios_id,
+        "origin": origem_id,
+        "suborigem_hash": suborigem_id,
     }
 
 
@@ -308,3 +323,221 @@ async def test_api_500_raises_runtime_error(mock_registry):
         await _call_tool(mock_registry)
     # Allow either RuntimeError or HTTPError as long as it isn't silently swallowed.
     assert exc.value is not None
+
+
+# ── New filters (expanded vocabulary) ────────────────────────────────────────
+
+
+@respx.mock
+async def test_hunter_filter_exact_match(mock_registry):
+    deals = [
+        _make_deal(1, hunter_id=500),  # Hunter A
+        _make_deal(2, hunter_id=501),  # Hunter B
+        _make_deal(3, hunter_id=500),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, hunter="Hunter A")
+    assert {d["id"] for d in result} == {1, 3}
+
+
+@respx.mock
+async def test_hunter_unknown_raises_value_error(mock_registry):
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
+    with pytest.raises(ValueError) as exc:
+        await _call_tool(mock_registry, hunter="Hunter Inexistente")
+    assert "Hunter" in str(exc.value)
+
+
+@respx.mock
+async def test_sdr_filter_exact_match(mock_registry):
+    deals = [
+        _make_deal(1, sdr_id=600),
+        _make_deal(2, sdr_id=601),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, sdr="SDR B")
+    assert {d["id"] for d in result} == {2}
+
+
+@respx.mock
+async def test_funcionarios_filter_accepts_list(mock_registry):
+    """funcionarios=['11-50', '51-200'] keeps deals in either bucket."""
+    deals = [
+        _make_deal(1, funcionarios_id=184),  # 11-50
+        _make_deal(2, funcionarios_id=185),  # 51-200
+        _make_deal(3, funcionarios_id=186),  # 201-500 (excluded)
+        _make_deal(4, funcionarios_id=None),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, funcionarios=["11-50", "51-200"])
+    assert {d["id"] for d in result} == {1, 2}
+
+
+@respx.mock
+async def test_funcionarios_unknown_bucket_raises(mock_registry):
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
+    with pytest.raises(ValueError):
+        await _call_tool(mock_registry, funcionarios=["999-9999"])
+
+
+@respx.mock
+async def test_origem_filter(mock_registry):
+    deals = [
+        _make_deal(1, origem_id=1),  # Site
+        _make_deal(2, origem_id=2),  # Indicação
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, origem="Site")
+    assert {d["id"] for d in result} == {1}
+
+
+@respx.mock
+async def test_suborigem_filter(mock_registry):
+    deals = [
+        _make_deal(1, suborigem_id=10),  # Form LP
+        _make_deal(2, suborigem_id=11),  # Email
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, suborigem="Form LP")
+    assert {d["id"] for d in result} == {1}
+
+
+@respx.mock
+async def test_motivo_perda_filter_exact_match(mock_registry):
+    deals = [
+        _make_deal(1, status="lost", lost_reason_id=15),  # Budget
+        _make_deal(2, status="lost", lost_reason_id=20),  # Timing
+        _make_deal(3, status="lost", lost_reason_id=15),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, status="lost", motivo_perda="Budget")
+    assert {d["id"] for d in result} == {1, 3}
+
+
+async def test_motivo_perda_requires_status_lost(mock_registry):
+    """motivo_perda only makes sense with status='lost'. Validated upfront → no HTTP call."""
+    with pytest.raises(ValueError) as exc:
+        await _call_tool(mock_registry, motivo_perda="Budget", status="open")
+    assert "status='lost'" in str(exc.value) or "lost" in str(exc.value)
+
+
+@respx.mock
+async def test_motivo_perda_unknown_raises(mock_registry):
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
+    with pytest.raises(ValueError):
+        await _call_tool(mock_registry, status="lost", motivo_perda="Motivo Inexistente")
+
+
+@respx.mock
+async def test_min_value_filter(mock_registry):
+    deals = [
+        _make_deal(1, value=5000),
+        _make_deal(2, value=20000),
+        _make_deal(3, value=100000),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, min_value=10000)
+    assert {d["id"] for d in result} == {2, 3}
+
+
+@respx.mock
+async def test_max_value_filter(mock_registry):
+    deals = [
+        _make_deal(1, value=5000),
+        _make_deal(2, value=20000),
+        _make_deal(3, value=100000),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, max_value=50000)
+    assert {d["id"] for d in result} == {1, 2}
+
+
+@respx.mock
+async def test_value_range_inclusive(mock_registry):
+    """min_value + max_value act as inclusive bounds [min, max]."""
+    deals = [
+        _make_deal(1, value=10000),  # equal to min — included
+        _make_deal(2, value=50000),  # equal to max — included
+        _make_deal(3, value=100000),
+        _make_deal(4, value=5000),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, min_value=10000, max_value=50000)
+    assert {d["id"] for d in result} == {1, 2}
+
+
+@respx.mock
+async def test_min_value_excludes_null_value(mock_registry):
+    """Deals without value are excluded when value range filter is applied."""
+    deals = [
+        _make_deal(1, value=20000),
+        {**_make_deal(2), "value": None},
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, min_value=1000)
+    assert {d["id"] for d in result} == {1}
+
+
+@respx.mock
+async def test_won_date_window(mock_registry):
+    deals = [
+        _make_deal(1, status="won", won_time="2026-01-15 10:00:00"),
+        _make_deal(2, status="won", won_time="2026-03-20 10:00:00"),
+        _make_deal(3, status="won", won_time="2026-06-01 10:00:00"),
+        _make_deal(4, status="open", won_time=None),  # No won_time → excluded
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry,
+        won_start_date="2026-01-01",
+        won_end_date="2026-03-31",
+    )
+    assert {d["id"] for d in result} == {1, 2}
+
+
+@respx.mock
+async def test_lost_date_window(mock_registry):
+    deals = [
+        _make_deal(1, status="lost", lost_time="2026-02-10 10:00:00"),
+        _make_deal(2, status="lost", lost_time="2026-05-01 10:00:00"),
+        _make_deal(3, status="open", lost_time=None),  # No lost_time → excluded
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry,
+        lost_start_date="2026-04-01",
+        lost_end_date="2026-06-30",
+    )
+    assert {d["id"] for d in result} == {2}
+
+
+@respx.mock
+async def test_compound_new_filters(mock_registry):
+    """Combining hunter + value range + won_date_window — all must match."""
+    deals = [
+        _make_deal(
+            1, status="won", value=50000, hunter_id=500,
+            won_time="2026-02-15 10:00:00",
+        ),
+        _make_deal(
+            2, status="won", value=5000, hunter_id=500,       # too cheap
+            won_time="2026-02-15 10:00:00",
+        ),
+        _make_deal(
+            3, status="won", value=50000, hunter_id=501,      # different hunter
+            won_time="2026-02-15 10:00:00",
+        ),
+        _make_deal(
+            4, status="won", value=50000, hunter_id=500,
+            won_time="2026-07-15 10:00:00",                   # outside window
+        ),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry,
+        hunter="Hunter A",
+        min_value=10000,
+        won_start_date="2026-01-01",
+        won_end_date="2026-06-30",
+    )
+    assert {d["id"] for d in result} == {1}

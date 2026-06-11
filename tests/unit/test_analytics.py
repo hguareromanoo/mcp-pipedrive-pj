@@ -36,9 +36,16 @@ def _make_deal(
     label: str = "32",
     canal_id: int = 28,
     portfolio_csv: str = "207",
+    setor_id: int = 167,
     add_time: str = "2026-05-01 10:00:00",
+    won_time: str | None = None,
     lost_time: str | None = None,
     lost_reason_id: int | None = None,
+    hunter_id: int | None = None,
+    sdr_id: int | None = None,
+    funcionarios_id: int | None = None,
+    origem_id: int | None = None,
+    suborigem_id: int | None = None,
 ):
     return {
         "id": id,
@@ -53,11 +60,17 @@ def _make_deal(
         "label": label,
         "add_time": add_time,
         "update_time": add_time,
+        "won_time": won_time,
         "lost_time": lost_time,
         "lost_reason": lost_reason_id,
         "97d0502cc2b489986844a93b374656e5acf179e1": canal_id,
         "e4339ab04542dcd1e1215e4bc17ee2bcf45a9652": portfolio_csv,
-        "6ea1ea74da5fbb8cb6a8dd741a96a9bc8b4e379f": 167,
+        "6ea1ea74da5fbb8cb6a8dd741a96a9bc8b4e379f": setor_id,
+        "hunter_hash": hunter_id,
+        "sdr_hash": sdr_id,
+        "0b2be49fb7615b170878d944a7cb05f6ec8f9e27": funcionarios_id,
+        "origin": origem_id,
+        "suborigem_hash": suborigem_id,
     }
 
 
@@ -314,3 +327,133 @@ async def test_b3_more_than_20_owners_raises(mock_registry):
     respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
     with pytest.raises(ValueError):
         await _call_tool(mock_registry, "get_owner_activity", owners=too_many)
+
+
+# ── New filters across all 3 analytics tools ─────────────────────────────────
+
+
+@respx.mock
+async def test_b1_filter_by_hunter(mock_registry):
+    """Conversion rate restricted to deals prospected by a specific hunter."""
+    deals = [
+        _make_deal(1, status="won", hunter_id=500),
+        _make_deal(2, status="lost", hunter_id=500),
+        _make_deal(3, status="won", hunter_id=501),  # filtered out
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(mock_registry, "get_conversion_rates", hunter="Hunter A")
+    assert result["overall"]["total"] == 2
+    assert result["overall"]["won"] == 1
+    assert result["overall"]["lost"] == 1
+
+
+@respx.mock
+async def test_b1_filter_by_value_range(mock_registry):
+    deals = [
+        _make_deal(1, status="won", value=5000),     # below min — excluded
+        _make_deal(2, status="won", value=20000),
+        _make_deal(3, status="lost", value=80000),
+        _make_deal(4, status="won", value=200000),   # above max — excluded
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", min_value=10000, max_value=100000
+    )
+    assert result["overall"]["total"] == 2
+    assert result["overall"]["won"] == 1
+
+
+@respx.mock
+async def test_b1_filter_by_won_date_window(mock_registry):
+    deals = [
+        _make_deal(1, status="won", won_time="2026-02-15 10:00:00"),
+        _make_deal(2, status="won", won_time="2026-07-15 10:00:00"),  # outside
+        _make_deal(3, status="open"),                                  # no won_time → excluded by window
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates",
+        won_start_date="2026-01-01", won_end_date="2026-06-30",
+    )
+    assert result["overall"]["total"] == 1
+    assert result["overall"]["won"] == 1
+
+
+@respx.mock
+async def test_b2_filter_by_setor(mock_registry):
+    """get_lost_reasons_analysis newly accepts `setor`."""
+    deals = [
+        _make_deal(1, status="lost", setor_id=167, lost_reason_id=15, lost_time="2026-05-01 10:00"),
+        _make_deal(2, status="lost", setor_id=158, lost_reason_id=20, lost_time="2026-05-02 10:00"),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_lost_reasons_analysis",
+        setor="Information Technology & Services",
+    )
+    assert result["total_lost"] == 1
+    assert "Budget" in result["by_reason"]
+    assert "Timing" not in result["by_reason"]
+
+
+@respx.mock
+async def test_b2_filter_by_hunter(mock_registry):
+    deals = [
+        _make_deal(1, status="lost", hunter_id=500, lost_reason_id=15, lost_time="2026-05-01 10:00"),
+        _make_deal(2, status="lost", hunter_id=501, lost_reason_id=15, lost_time="2026-05-02 10:00"),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_lost_reasons_analysis", hunter="Hunter A"
+    )
+    assert result["total_lost"] == 1
+
+
+@respx.mock
+async def test_b2_filter_by_min_value(mock_registry):
+    deals = [
+        _make_deal(1, status="lost", value=5000, lost_reason_id=15, lost_time="2026-05-01 10:00"),
+        _make_deal(2, status="lost", value=50000, lost_reason_id=20, lost_time="2026-05-02 10:00"),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_lost_reasons_analysis", min_value=10000
+    )
+    assert result["total_lost"] == 1
+    assert "Timing" in result["by_reason"]
+
+
+@respx.mock
+async def test_b3_filter_by_cn_name(mock_registry):
+    """get_owner_activity newly accepts `cn_name` to restrict by API filter."""
+    route = respx.get(f"{BASE}/deals").mock(
+        return_value=httpx.Response(200, json=_envelope([_make_deal(1)]))
+    )
+    respx.get(f"{BASE}/activities").mock(
+        return_value=httpx.Response(200, json=_envelope([]))
+    )
+    await _call_tool(mock_registry, "get_owner_activity", cn_name="João Silva")
+    # cn_name resolves to user_id=101 and is sent as the API param
+    assert "user_id=101" in str(route.calls.last.request.url)
+
+
+@respx.mock
+async def test_b3_filter_by_hunter(mock_registry):
+    deals = [
+        _make_deal(1, status="open", hunter_id=500),
+        _make_deal(2, status="open", hunter_id=501),
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    respx.get(f"{BASE}/activities").mock(return_value=httpx.Response(200, json=_envelope([])))
+    result = await _call_tool(mock_registry, "get_owner_activity", hunter="Hunter A")
+    # Only 1 deal matches; it's owned by Henrique Romano (default)
+    h = result["by_owner"]["Henrique Romano"]
+    assert h["deals_total"] == 1
+    assert h["deals_open"] == 1
+
+
+@respx.mock
+async def test_b3_filter_unknown_hunter_raises(mock_registry):
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
+    with pytest.raises(ValueError):
+        await _call_tool(mock_registry, "get_owner_activity", hunter="Hunter Inexistente")

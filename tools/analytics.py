@@ -84,24 +84,41 @@ async def _fetch_filtered_deals(
     portfolio: list[str] | None = None,
     canal: str | None = None,
     setor: str | None = None,
+    funcionarios: list[str] | None = None,
+    origem: str | None = None,
+    suborigem: str | None = None,
     cn_name: str | None = None,
+    hunter: str | None = None,
+    sdr: str | None = None,
     pipeline: str | None = None,
     status: str = "all_not_deleted",
     start_date: str | None = None,
     end_date: str | None = None,
     date_field: str = "add_time",
+    won_start_date: str | None = None,
+    won_end_date: str | None = None,
+    lost_start_date: str | None = None,
+    lost_end_date: str | None = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
 ) -> list[dict]:
     """Fetch deals with the same filter vocabulary as A1.
 
-    Returns raw deal dicts (not serialized). Date window is applied in memory
-    on `date_field` (default add_time; B2 uses lost_time).
+    Returns raw deal dicts (not serialized). Date window (start_date/end_date)
+    is applied in memory on `date_field` (default add_time; B2 uses lost_time).
+    Independent won_*/lost_* date windows always apply to won_time/lost_time.
     """
     # Resolve filter values
     label_option_id: int | None = None
     portfolio_option_ids: list[int] = []
     canal_option_id: int | None = None
     setor_option_id: int | None = None
+    funcionarios_option_ids: list[int] = []
+    origem_option_id: int | None = None
+    suborigem_option_id: int | None = None
     owner_id: int | None = None
+    hunter_option_id: int | None = None
+    sdr_option_id: int | None = None
     pipeline_id_int: int | None = None
 
     try:
@@ -115,8 +132,21 @@ async def _fetch_filtered_deals(
             canal_option_id = registry.option_id("deal", "Canal de Entrada", canal)
         if setor is not None:
             setor_option_id = registry.option_id("deal", "Setor da Empresa", setor)
+        if funcionarios is not None:
+            funcionarios_option_ids = [
+                registry.option_id("deal", "Número de Funcionários", f)
+                for f in funcionarios
+            ]
+        if origem is not None:
+            origem_option_id = registry.option_id("deal", "Origem", origem)
+        if suborigem is not None:
+            suborigem_option_id = registry.option_id("deal", "Suborigem", suborigem)
         if cn_name is not None:
             owner_id = registry.user_id_by_name(cn_name)
+        if hunter is not None:
+            hunter_option_id = registry.option_id("deal", "Hunter", hunter)
+        if sdr is not None:
+            sdr_option_id = registry.option_id("deal", "SDR", sdr)
         if pipeline is not None:
             pipeline_id_int = _resolve_pipeline(registry, pipeline)
     except KeyError as e:
@@ -157,6 +187,21 @@ async def _fetch_filtered_deals(
     canal_key = registry.field_key("deal", "Canal de Entrada") if canal is not None else None
     setor_key = registry.field_key("deal", "Setor da Empresa") if setor is not None else None
     portfolio_key = registry.field_key("deal", "Portfólio") if portfolio is not None else None
+    funcionarios_key = registry.field_key("deal", "Número de Funcionários") if funcionarios is not None else None
+    origem_key = registry.field_key("deal", "Origem") if origem is not None else None
+    suborigem_key = registry.field_key("deal", "Suborigem") if suborigem is not None else None
+    hunter_key = registry.field_key("deal", "Hunter") if hunter is not None else None
+    sdr_key = registry.field_key("deal", "SDR") if sdr is not None else None
+
+    def _in_window(ts: Any, start: str | None, end: str | None) -> bool:
+        if not ts:
+            return False
+        d = str(ts)[:10]
+        if start is not None and d < start:
+            return False
+        if end is not None and d > end:
+            return False
+        return True
 
     def matches(deal: dict) -> bool:
         if nucleo is not None:
@@ -173,14 +218,41 @@ async def _fetch_filtered_deals(
         if setor is not None and setor_key is not None:
             if _to_int(deal.get(setor_key)) != setor_option_id:
                 return False
+        if funcionarios is not None and funcionarios_key is not None:
+            if _to_int(deal.get(funcionarios_key)) not in set(funcionarios_option_ids):
+                return False
+        if origem is not None and origem_key is not None:
+            if _to_int(deal.get(origem_key)) != origem_option_id:
+                return False
+        if suborigem is not None and suborigem_key is not None:
+            if _to_int(deal.get(suborigem_key)) != suborigem_option_id:
+                return False
+        if hunter is not None and hunter_key is not None:
+            if _to_int(deal.get(hunter_key)) != hunter_option_id:
+                return False
+        if sdr is not None and sdr_key is not None:
+            if _to_int(deal.get(sdr_key)) != sdr_option_id:
+                return False
         if start_date is not None or end_date is not None:
-            raw = deal.get(date_field)
-            if not raw:
+            if not _in_window(deal.get(date_field), start_date, end_date):
                 return False
-            deal_date = str(raw)[:10]
-            if start_date is not None and deal_date < start_date:
+        if won_start_date is not None or won_end_date is not None:
+            if not _in_window(deal.get("won_time"), won_start_date, won_end_date):
                 return False
-            if end_date is not None and deal_date > end_date:
+        if lost_start_date is not None or lost_end_date is not None:
+            if not _in_window(deal.get("lost_time"), lost_start_date, lost_end_date):
+                return False
+        if min_value is not None or max_value is not None:
+            v = deal.get("value")
+            if v is None or v == "":
+                return False
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                return False
+            if min_value is not None and vf < min_value:
+                return False
+            if max_value is not None and vf > max_value:
                 return False
         return True
 
@@ -264,10 +336,21 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         portfolio: list[str] | None = None,
         canal: str | None = None,
         setor: str | None = None,
+        funcionarios: list[str] | None = None,
+        origem: str | None = None,
+        suborigem: str | None = None,
         cn_name: str | None = None,
+        hunter: str | None = None,
+        sdr: str | None = None,
         pipeline: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        won_start_date: str | None = None,
+        won_end_date: str | None = None,
+        lost_start_date: str | None = None,
+        lost_end_date: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
         group_by: Literal["nucleo", "canal", "owner", "portfolio", None] = None,
     ) -> dict:
         """
@@ -303,11 +386,22 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             portfolio=portfolio,
             canal=canal,
             setor=setor,
+            funcionarios=funcionarios,
+            origem=origem,
+            suborigem=suborigem,
             cn_name=cn_name,
+            hunter=hunter,
+            sdr=sdr,
             pipeline=pipeline,
             status="all_not_deleted",
             start_date=start_date,
             end_date=end_date,
+            won_start_date=won_start_date,
+            won_end_date=won_end_date,
+            lost_start_date=lost_start_date,
+            lost_end_date=lost_end_date,
+            min_value=min_value,
+            max_value=max_value,
         )
 
         overall = _compute_stats(deals)
@@ -317,10 +411,21 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             "portfolio": portfolio,
             "canal": canal,
             "setor": setor,
+            "funcionarios": funcionarios,
+            "origem": origem,
+            "suborigem": suborigem,
             "cn_name": cn_name,
+            "hunter": hunter,
+            "sdr": sdr,
             "pipeline": pipeline,
             "start_date": start_date,
             "end_date": end_date,
+            "won_start_date": won_start_date,
+            "won_end_date": won_end_date,
+            "lost_start_date": lost_start_date,
+            "lost_end_date": lost_end_date,
+            "min_value": min_value,
+            "max_value": max_value,
         }
 
         result: dict[str, Any] = {
@@ -349,10 +454,18 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         nucleo: str | None = None,
         portfolio: list[str] | None = None,
         canal: str | None = None,
+        setor: str | None = None,
+        funcionarios: list[str] | None = None,
+        origem: str | None = None,
+        suborigem: str | None = None,
         cn_name: str | None = None,
+        hunter: str | None = None,
+        sdr: str | None = None,
         pipeline: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
         group_by: Literal["owner", "canal", "nucleo", "portfolio", None] = None,
     ) -> dict:
         """
@@ -382,12 +495,20 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             nucleo=nucleo,
             portfolio=portfolio,
             canal=canal,
+            setor=setor,
+            funcionarios=funcionarios,
+            origem=origem,
+            suborigem=suborigem,
             cn_name=cn_name,
+            hunter=hunter,
+            sdr=sdr,
             pipeline=pipeline,
             status="lost",
             start_date=start_date,
             end_date=end_date,
             date_field="lost_time",
+            min_value=min_value,
+            max_value=max_value,
         )
 
         lost_reason_field = _lost_reason_field_name(registry)
@@ -437,10 +558,18 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             "nucleo": nucleo,
             "portfolio": portfolio,
             "canal": canal,
+            "setor": setor,
+            "funcionarios": funcionarios,
+            "origem": origem,
+            "suborigem": suborigem,
             "cn_name": cn_name,
+            "hunter": hunter,
+            "sdr": sdr,
             "pipeline": pipeline,
             "start_date": start_date,
             "end_date": end_date,
+            "min_value": min_value,
+            "max_value": max_value,
         }
 
         result: dict[str, Any] = {
@@ -474,9 +603,18 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         nucleo: str | None = None,
         portfolio: list[str] | None = None,
         canal: str | None = None,
+        setor: str | None = None,
+        funcionarios: list[str] | None = None,
+        origem: str | None = None,
+        suborigem: str | None = None,
+        cn_name: str | None = None,
+        hunter: str | None = None,
+        sdr: str | None = None,
         pipeline: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        min_value: float | None = None,
+        max_value: float | None = None,
         owners: list[str] | None = None,
     ) -> dict:
         """
@@ -529,10 +667,19 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             nucleo=nucleo,
             portfolio=portfolio,
             canal=canal,
+            setor=setor,
+            funcionarios=funcionarios,
+            origem=origem,
+            suborigem=suborigem,
+            cn_name=cn_name,
+            hunter=hunter,
+            sdr=sdr,
             pipeline=pipeline,
             status="all_not_deleted",
             start_date=start_date,
             end_date=end_date,
+            min_value=min_value,
+            max_value=max_value,
         )
 
         # Group deals by owner_name
@@ -664,9 +811,18 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             "nucleo": nucleo,
             "portfolio": portfolio,
             "canal": canal,
+            "setor": setor,
+            "funcionarios": funcionarios,
+            "origem": origem,
+            "suborigem": suborigem,
+            "cn_name": cn_name,
+            "hunter": hunter,
+            "sdr": sdr,
             "pipeline": pipeline,
             "start_date": start_date,
             "end_date": end_date,
+            "min_value": min_value,
+            "max_value": max_value,
             "owners": owners,
         }
 
