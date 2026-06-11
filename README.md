@@ -1,157 +1,206 @@
-# NDados Pipedrive MCP Server
+# MCP Pipedrive — Poli Júnior
 
-Python MCP server for Pipedrive CRM, built for the NDados nucleus at Poli Júnior.
-Extends standard Pipedrive CRUD with intent-centered tools that combine Pipedrive data,
-Google Drive, and AssemblyAI into high-context outputs for the commercial team.
+Read-only MCP server that exposes the Poli Júnior Pipedrive CRM to Claude
+(Desktop or Code) as composable tools. Built for the four commercial cargos
+of the PJ: Diretor Executivo, Gerente Comercial de Núcleo, Líder de Outbound,
+e Coordenador de Negócios.
+
+The MCP focuses strictly on Pipedrive data — listing, filtering, aggregating,
+fetching individual entities. Meeting transcription, Drive integration, and
+any write-side workflow are explicitly out of scope (they belong to other,
+purpose-built MCPs).
 
 ---
 
 ## Architecture
 
 ```
-mcp_server/
-├── server.py                    # FastMCP entrypoint — tool registration
-├── fields.py                    # ✅ DONE — Pipedrive field keys + enum option maps
-├── pipedrive.py                 # Pipedrive API client (async httpx)
+mcp-pipedrive-pj/
+├── server.py              # FastMCP entrypoint + monkey-patches mcp.tool with observability
+├── pipedrive.py           # Async HTTP client: pd() returns body['data']; pd_raw() returns full envelope
+├── field_registry.py      # FieldsRegistry: dynamic schema discovery + disk cache (TTL 6h)
+├── fields.py              # LEGACY hardcoded hashes/options used only by get_deal_context
+├── observability.py       # instrument() decorator → .observability/usage.jsonl per tool call
+│
 ├── tools/
-│   └── get_deal_context.py      # Intent-centered tool — see get-deal-context.md
-└── pipeline/
-    ├── node_process_media_at_drive.py   # Google Drive download + file routing
-    └── pipeline.py                      # AssemblyAI transcription + Docling PDF
+│   ├── list_deals_with_filters.py   # A1 — filtros compostos + include_fields
+│   ├── base_gets.py                  # A4 — 7 read tools (person, org, notes, activities, list_*)
+│   ├── analytics.py                  # B1/B2/B3 — conversion / lost reasons / owner activity
+│   ├── get_deal_context.py           # Legacy CRM briefing (uses fields.py, no transcription)
+│   └── find_deals.py                 # Legacy text search (redundant with A1; candidate for removal)
+│
+├── plans/                 # Per-tool specs (signature, internal flow, error handling)
+├── tests/
+│   ├── unit/              # respx mocks + mock_registry fixture
+│   └── integration/       # Real Pipedrive instance, gated on PIPEDRIVE_API_TOKEN
+└── pytest.ini
 ```
 
-### Two layers of tools
+### FieldsRegistry — why it exists
 
-**Layer 1 — Pipedrive CRUD (port from TypeScript reference)**
-Standard create/read/update/delete for deals, persons, organizations, activities,
-notes, pipelines, stages. Reference implementation:
-https://github.com/GarethWright/PipeDrive-MCP-Server/blob/master/src/index.ts
+Pipedrive custom fields are addressed by opaque hash keys (`6ea1ea74...`) and
+their enum options are numeric IDs. The PJ instance also renames fields,
+adds options (new núcleo, new sector), and deletes/recreates fields over time.
 
-Port the patterns directly to Python/httpx. The TypeScript file covers all endpoints
-and serves as the source of truth for parameter names and API paths.
-
-**Layer 2 — Intent-centered tools (new)**
-Tools that fulfill a complete user intent in one call, composing multiple
-Pipedrive endpoints + external services internally. Currently planned:
-- `get_deal_context` — full deal briefing with transcribed meetings (see get-deal-context.md)
-
----
-
-## Stack
-
-| Concern | Tool |
-|---|---|
-| MCP framework | `fastmcp` (Python) |
-| HTTP client | `httpx` with `asyncio.gather` for parallel requests |
-| Google Drive | `google-api-python-client` + OAuth2 (`google-auth-oauthlib`) |
-| Transcription | `assemblyai` SDK |
-| PDF extraction | `docling` |
-| Transport | `stdio` (local, Claude Desktop / Claude Code) |
-
----
-
-## Environment Variables
-
-```env
-# Pipedrive
-PIPEDRIVE_API_TOKEN=your_token_here
-PIPEDRIVE_BASE_URL=https://api.pipedrive.com/v1   # default, override for custom domains
-
-# AssemblyAI
-ASSEMBLYAI_API_KEY=your_key_here
-
-# Google Drive OAuth (file paths, not values)
-GOOGLE_CREDENTIALS_FILE=./credentials.json        # OAuth client ID from GCP
-GOOGLE_TOKEN_FILE=./token.json                     # auto-created after first auth flow
-```
-
-No MinIO required — files are downloaded from Drive to a local temp dir,
-passed directly to AssemblyAI SDK by file path, then cleaned up.
-
----
-
-## Key Files Already Built
-
-### `fields.py` ✅
-All Pipedrive custom field hash keys and enum option maps, with resolver helpers.
-Do not hardcode field keys anywhere else in the codebase — always import from here.
+`FieldsRegistry` discovers the schema at runtime, caches it in
+`.cache/pipedrive_schema.json` (TTL 6h, falls back to stale cache when the
+API is unreachable), and exposes resolution by human-readable name:
 
 ```python
-from fields import (
-    DRIVE_FIELD, CANAL_FIELD, PORTFOLIO_FIELD, SETOR_FIELD,
-    FUNCIONARIOS_FIELD, LOST_REASON_FIELD, LABEL_FIELD,
-    CANAL_OPTIONS, SETOR_OPTIONS, FUNCIONARIOS_OPTIONS,
-    PORTFOLIO_OPTIONS, LOST_REASON_OPTIONS, LABEL_OPTIONS,
-    resolve_enum, resolve_set
-)
+registry.field_key("deal", "Setor da Empresa")      # → hash
+registry.option_id("deal", "Etiqueta", "NDados")    # → 32
+registry.user_id_by_name("Henrique Romano")         # → 100
+registry.serialize_deal(deal, include_fields=[...]) # → human-readable dict
 ```
 
-### `pipeline/node_process_media_at_drive.py` (from repo)
-Downloads all files from a Google Drive folder link and routes by file type.
-Entry point: `process_media_at_drive(state: dict) -> dict`
+All v1 tools resolve names through the registry. None of them imports from
+`fields.py`. The legacy `get_deal_context` tool still uses `fields.py` —
+migration to the registry is a follow-up task (a.k.a. "C5").
 
-- Input: `state = {"drive_link": "https://drive.google.com/..."}`
-- Output: `{"drive_transcriptions": ["[Áudio/Vídeo - file.mp4]:\nSpeaker A: ...", ...]}`
-- Handles: folders and single files, audio/video → AssemblyAI, PDF → Docling, text → read
-- Manages: temp dir creation, per-file cleanup, error isolation per file
+### Observability
 
-### `pipeline/pipeline.py` (from repo)
-Core processing functions.
+`observability.instrument(fn)` wraps every registered tool. Each invocation
+writes one JSON line to `.observability/usage.jsonl`:
 
-`process_audio(file_path: str, context: dict) -> str`
-- Sends local file to AssemblyAI SDK (handles upload internally)
-- `context` keys: `org_name`, `person_name`, `person_position`, `org_setor`
-- Context builds a domain-specific prompt for NDados sales meetings
-- Returns speaker-labeled transcript: `"Speaker A: ...\nSpeaker B: ..."`
-- Config: `speaker_labels=True`, `language_detection=True`, `word_boost=[NDados terms]`
-
-`process_pdf(file_path: str) -> str`
-- Extracts PDF content via Docling, returns markdown
-
-`cleanup_local_file(filepath: str)` — safe temp file removal
-
----
-
-## Pipedrive API Patterns
-
-Base URL: `https://api.pipedrive.com/v1`
-Auth: `?api_token={PIPEDRIVE_API_TOKEN}` appended to every request (query param).
-
-All responses follow:
 ```json
-{ "success": true, "data": { ... } }
+{"timestamp":"2026-06-10T17:23:09.104Z","tool":"list_deals_with_filters","latency_ms":1347,"status":"ok"}
 ```
-Always access `response["data"]`. On error: `{ "success": false, "error": "..." }`.
 
-Enum and set fields in deal/person/org responses return **numeric IDs**, not labels.
-Always resolve through the option maps in `fields.py`.
+On error:
+
+```json
+{"timestamp":"...","tool":"get_person","latency_ms":87,"status":"error","error_type":"ValueError","error_message":"Person not found: 999999"}
+```
+
+Failures during the log write are swallowed silently so they never block the
+tool's return.
 
 ---
 
-## Claude Desktop Config (stdio)
+## Tools
+
+| Tool | Persona-alvo | What it does |
+|---|---|---|
+| `list_deals_with_filters` | DE / Gerente / LO / CN | Lista deals com filtros compostos: núcleo, portfólio, canal, setor, CN owner, stage, pipeline, status, período. `include_fields` controla shape do output. |
+| `get_person` | todas | Busca pessoa (contato) por ID com `include_fields` opcional. |
+| `get_organization` | todas | Busca organização por ID com `include_fields` opcional. |
+| `get_notes` | todas | Notas atreladas a um deal / pessoa / org (exatamente um). |
+| `get_activities` | todas | Atividades (calls, meetings, tasks) atreladas a um deal / pessoa / org. Filtro opcional `done`. |
+| `list_pipelines` | todas | Funis configurados no Pipedrive (id + name). |
+| `list_stages` | todas | Etapas, opcionalmente filtradas por pipeline. |
+| `list_users` | todas | Usuários do workspace (resolução de nomes de CN/owner). |
+| `get_conversion_rates` | DE / Gerente | Close-rate e win-rate sobre o conjunto filtrado, com `group_by` opcional (núcleo, canal, owner, portfólio). |
+| `get_lost_reasons_analysis` | DE / Gerente | Agregação de "Motivo da perda" sobre deals lost. Filtro de data aplica em `lost_time`. |
+| `get_owner_activity` | DE / LO | Snapshot por owner: deals por status, hot/cold, tasks atrasadas, valor open. |
+| `get_deal_context` | CN / todas | Briefing markdown do deal (CRM apenas — sem transcrição). Legado, ainda usa `fields.py`. |
+| `find_deals` | (legacy) | Busca por termo no título. Redundante com `list_deals_with_filters`. |
+
+---
+
+## Setup
+
+### Requirements
+
+- Python 3.13+
+- Pipedrive REST API token (https://app.pipedrive.com/settings/personal/api)
+
+### Install
+
+```bash
+git clone https://github.com/hguareromanoo/mcp-pipedrive-pj.git
+cd mcp-pipedrive-pj
+python3.13 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt        # runtime
+pip install -r requirements-dev.txt    # + pytest, respx, etc.
+```
+
+### Configure
+
+Copy `.env.example` to `.env` and fill in:
+
+```bash
+cp .env.example .env
+# edit .env to add your PIPEDRIVE_API_TOKEN
+```
+
+### Run as Claude Desktop MCP
+
+Add this entry to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "ndados-pipedrive": {
-      "command": "python",
-      "args": ["path/to/server.py"],
+    "pipedrive-pj": {
+      "command": "/abs/path/to/mcp-pipedrive-pj/venv/bin/python",
+      "args": ["/abs/path/to/mcp-pipedrive-pj/server.py"],
       "env": {
-        "PIPEDRIVE_API_TOKEN": "...",
-        "ASSEMBLYAI_API_KEY": "...",
-        "GOOGLE_CREDENTIALS_FILE": "path/to/credentials.json",
-        "GOOGLE_TOKEN_FILE": "path/to/token.json"
+        "PIPEDRIVE_API_TOKEN": "your_token_here",
+        "PYTHONPATH": "/abs/path/to/mcp-pipedrive-pj"
       }
     }
   }
 }
 ```
 
+Restart Claude Desktop. The 13 tools above appear under `pipedrive-pj`.
+
+### Smoke test (from terminal)
+
+```bash
+source venv/bin/activate
+python -c "import server; print('server.py imports OK')"
+```
+
 ---
 
-## Implementation Order
+## Tests
 
-1. `pipedrive.py` — async API client with `pd(method, path, data, params)` helper
-2. `server.py` — FastMCP scaffold with env var validation on startup
-3. `tools/get_deal_context.py` — first intent-centered tool (see get-deal-context.md)
-4. CRUD tools — port from TypeScript reference, register in `server.py`
+```bash
+source venv/bin/activate
+
+# Unit (mocked via respx, no network)
+pytest tests/unit/ -v
+
+# Integration (hits the real Pipedrive instance via PIPEDRIVE_API_TOKEN)
+pytest tests/integration/ -v
+
+# Everything (≈ 2.5 min, dominated by integration tests against the real API)
+pytest tests/
+```
+
+Tests gated on `@pytest.mark.integration` skip automatically when
+`PIPEDRIVE_API_TOKEN` is absent. Current baseline: **116 passing.**
+
+---
+
+## Scope decisions baked in
+
+- **Read-only in v1.** Bulk write operations on Pipedrive are explicitly out
+  of scope. The 4 legacy write-side CN tools (`log_meeting`, `advance_deal`,
+  `register_prospect`, `resolve_deal`) were removed — they are easier to do
+  directly in the Pipedrive UI.
+- **Meeting transcription is NOT here.** Drive + AssemblyAI integration was
+  removed: typical PJ recording folders carry 7-8 `.mkv` files of 500MB-1.4GB
+  each, totaling 30+ minutes of work per call. That does not fit a
+  synchronous MCP request-response model. A separate "meeting intelligence"
+  MCP is the right home for it.
+- **`include_fields` everywhere.** Read tools accept a subset of fields to
+  return, keeping LLM context windows tight.
+- **API quirks documented in `PRD.md`.** The two that bit us:
+  - `/v1/deals` filters by `user_id`, not `owner_id` (the latter is silently
+    ignored by the API).
+  - `start_date` / `end_date` on `/v1/deals` filter by `update_time`, not
+    `add_time` — A1 applies the date window in memory to honor the
+    documented contract.
+
+---
+
+## Status
+
+- v1 feature-complete: A1, A4 (×7), B1, B2, B3, D2 (observability),
+  FieldsRegistry, 116 passing tests.
+- Legacy survivors: `get_deal_context` (kept), `find_deals` (kept, candidate
+  for next cleanup).
+- Pendente: piloto com early adopters (1 CN, 1 LO, 1 Gerente) + skills
+  layered per cargo + handoff plan for after the original CIC steps down.
