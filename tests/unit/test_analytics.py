@@ -46,6 +46,8 @@ def _make_deal(
     funcionarios_id: int | None = None,
     origem_id: int | None = None,
     suborigem_id: int | None = None,
+    stage_id: int = 5,
+    pipeline_id: int = 1,
 ):
     return {
         "id": id,
@@ -53,8 +55,8 @@ def _make_deal(
         "value": value,
         "currency": "BRL",
         "status": status,
-        "stage_id": 5,
-        "pipeline_id": 1,
+        "stage_id": stage_id,
+        "pipeline_id": pipeline_id,
         "user_id": {"id": 100, "name": owner_name},
         "owner_name": owner_name,
         "label": label,
@@ -457,3 +459,119 @@ async def test_b3_filter_unknown_hunter_raises(mock_registry):
     respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
     with pytest.raises(ValueError):
         await _call_tool(mock_registry, "get_owner_activity", hunter="Hunter Inexistente")
+
+
+# ── B1 multi-step funnel (auto when pipeline is set) ─────────────────────────
+# Stage fixtures (tests/conftest.py): pipeline 1 ("Funil Comercial") =
+#   id=5 "AT Marcada" (order 1), id=6 "Proposta Apresentada" (order 2),
+#   id=7 "Negociação" (order 3).
+# Pipeline 2 ("Funil Outbound"): id=10 "AT Marcada" (order 1).
+# Funnel formula: count(X) = #won + #lost where current stage order_nr ≥ X.
+
+
+@respx.mock
+async def test_b1_funnel_happy_path(mock_registry):
+    """Lost deals park at death stage; counts cascade by order_nr."""
+    deals = [
+        _make_deal(1, status="lost", stage_id=5),  # lost at AT (order 1)
+        _make_deal(2, status="lost", stage_id=6),  # lost at Proposta (order 2)
+        _make_deal(3, status="lost", stage_id=7),  # lost at Negociação (order 3)
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", pipeline="Funil Comercial"
+    )
+    funnel = result["funnel"]
+    # 0 won; lost-at-or-past order 1 = 3, order 2 = 2, order 3 = 1
+    assert funnel["stages"] == [
+        {"name": "AT Marcada", "count": 3},
+        {"name": "Proposta Apresentada", "count": 2},
+        {"name": "Negociação", "count": 1},
+    ]
+    rates = [t["rate"] for t in funnel["transitions"]]
+    assert rates == [2 / 3, 1 / 2]
+
+
+@respx.mock
+async def test_b1_funnel_won_counts_in_every_stage(mock_registry):
+    """A won deal counts in EVERY stage of the funnel."""
+    deals = [
+        _make_deal(1, status="won", stage_id=5),   # won (at AT) — counts everywhere
+        _make_deal(2, status="lost", stage_id=7),  # lost at Negociação
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", pipeline="Funil Comercial"
+    )
+    counts = [s["count"] for s in result["funnel"]["stages"]]
+    # won=1 (every stage) + lost-at-or-past order: 1, 1, 1
+    assert counts == [2, 2, 2]
+
+
+@respx.mock
+async def test_b1_funnel_open_excluded(mock_registry):
+    """Open deals are not counted in funnel (polui)."""
+    deals = [
+        _make_deal(1, status="open", stage_id=5),  # open — excluded
+        _make_deal(2, status="open", stage_id=6),  # open — excluded
+        _make_deal(3, status="open", stage_id=7),  # open — excluded
+        _make_deal(4, status="won", stage_id=7),   # won
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", pipeline="Funil Comercial"
+    )
+    counts = [s["count"] for s in result["funnel"]["stages"]]
+    # only the 1 won deal counts
+    assert counts == [1, 1, 1]
+
+
+@respx.mock
+async def test_b1_funnel_lost_from_other_pipeline_ignored(mock_registry):
+    """A lost deal whose stage is from another pipeline is not in the funnel.
+    Safety check — in practice _fetch_filtered_deals filters by pipeline natively."""
+    deals = [
+        _make_deal(1, status="lost", stage_id=7),    # lost at Negociação (pipe 1)
+        _make_deal(2, status="lost", stage_id=10),   # stage 10 = pipe 2 — ignored
+    ]
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", pipeline="Funil Comercial"
+    )
+    counts = [s["count"] for s in result["funnel"]["stages"]]
+    # only the 1 lost in pipeline 1 counts
+    assert counts == [1, 1, 1]
+
+
+@respx.mock
+async def test_b1_funnel_zero_denominator_rate_is_none(mock_registry):
+    """Empty / all-open dataset → all counts 0 → all rates None."""
+    deals = [_make_deal(1, status="open", stage_id=5)]  # open is excluded
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope(deals)))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", pipeline="Funil Comercial"
+    )
+    counts = [s["count"] for s in result["funnel"]["stages"]]
+    assert counts == [0, 0, 0]
+    rates = [t["rate"] for t in result["funnel"]["transitions"]]
+    assert rates == [None, None]
+
+
+@respx.mock
+async def test_b1_funnel_absent_when_pipeline_not_set(mock_registry):
+    """No pipeline → no funnel in response (stages are pipeline-scoped)."""
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([_make_deal(1)])))
+    result = await _call_tool(mock_registry, "get_conversion_rates")
+    assert "funnel" not in result
+
+
+@respx.mock
+async def test_b1_funnel_transitions_count(mock_registry):
+    """N stages in pipeline → N-1 transitions."""
+    respx.get(f"{BASE}/deals").mock(return_value=httpx.Response(200, json=_envelope([])))
+    result = await _call_tool(
+        mock_registry, "get_conversion_rates", pipeline="Funil Comercial"
+    )
+    # Pipeline 1 fixture has 3 stages → 2 transitions
+    assert len(result["funnel"]["stages"]) == 3
+    assert len(result["funnel"]["transitions"]) == 2

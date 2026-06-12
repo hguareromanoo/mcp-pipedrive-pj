@@ -74,7 +74,7 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         min_value: float | None = None,
         max_value: float | None = None,
         include_fields: list[str] | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[dict]:
         """
         List Pipedrive deals filtering by any combination of business attributes
@@ -113,7 +113,8 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
                 (id, title, value, currency, stage_name, pipeline_name, owner_name,
                 status, label_names, add_time, update_time). To see custom fields
                 like "Setor da Empresa" or "Portfólio", list them here.
-            limit: Max deals returned (default 100; cap on aggregate pagination is 5000).
+            limit: Max deals returned (default 100). Pass `None` to fetch ALL
+                matching deals (no cap). Use with care on broad filters.
 
         Returns:
             List of dicts. Each dict has the default subset or the include_fields requested.
@@ -209,9 +210,10 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             params["end_date"] = end_date
 
         # Step 4 — Paginate
-        # Early-termination target: if custom (post-)filters are present we may
-        # need to fetch more than `limit` because some will be filtered out.
-        # Without custom filters, we can stop as soon as we have `limit` deals.
+        # Early-termination target: when limit is bounded and post-filters are
+        # present we fetch up to 5× limit to compensate for in-memory drops.
+        # When limit is None, paginate ALL matching pages (no cap) — per user
+        # request "listar all deals".
         has_post_filter = any(
             f is not None
             for f in (
@@ -222,7 +224,13 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
                 min_value, max_value,
             )
         )
-        fetch_target = limit * 5 if has_post_filter else limit
+        fetch_target: int | None
+        if limit is None:
+            fetch_target = None
+        elif has_post_filter:
+            fetch_target = limit * 5
+        else:
+            fetch_target = limit
 
         deals: list[dict] = []
         while True:
@@ -235,16 +243,22 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
                 ) from e
 
             items = page.get("data") or []
+            if not items:
+                break
             deals.extend(items)
             pg = (page.get("additional_data") or {}).get("pagination") or {}
             if not pg.get("more_items_in_collection"):
                 break
-            if len(deals) >= fetch_target:
+            if fetch_target is not None and len(deals) >= fetch_target:
                 break
-            params["start"] = pg.get("next_start") or (params["start"] + 500)
-            if len(deals) > 5000:
+            next_start = pg.get("next_start")
+            if next_start is None:
+                break
+            params["start"] = next_start
+            # Safety cap only when limit is bounded; limit=None is opt-in for full pull.
+            if limit is not None and len(deals) > 5000:
                 raise RuntimeError(
-                    "Pagination exceeded safety cap of 5000 deals; tighten filters."
+                    "Pagination exceeded safety cap of 5000 deals; tighten filters or pass limit=None."
                 )
 
         # Step 5 — Post-filter custom fields in memory
@@ -330,8 +344,9 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
 
         deals = [d for d in deals if matches(d)]
 
-        # Step 6 — Truncate to limit
-        deals = deals[:limit]
+        # Step 6 — Truncate to limit (None = return all)
+        if limit is not None:
+            deals = deals[:limit]
 
         # Step 7 — Serialize each deal
         return [registry.serialize_deal(d, include_fields) for d in deals]
