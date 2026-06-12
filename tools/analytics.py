@@ -8,6 +8,7 @@ See plans/B-analytics.md for the full spec.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from typing import Any, Literal
 
@@ -162,6 +163,8 @@ async def _fetch_filtered_deals(
     if pipeline_id_int is not None:
         params["pipeline_id"] = pipeline_id_int
 
+    # Paginate /v1/deals with start/limit=500. No cap — the analytics tools
+    # need accurate counts (funnel breaks if data is truncated).
     deals: list[dict] = []
     while True:
         try:
@@ -173,15 +176,16 @@ async def _fetch_filtered_deals(
             ) from e
 
         items = page.get("data") or []
+        if not items:
+            break
         deals.extend(items)
         pg = (page.get("additional_data") or {}).get("pagination") or {}
         if not pg.get("more_items_in_collection"):
             break
-        params["start"] = pg.get("next_start") or (params["start"] + 500)
-        if len(deals) > 50000:
-            raise RuntimeError(
-                "Pagination exceeded safety cap of 50000 deals; tighten filters."
-            )
+        next_start = pg.get("next_start")
+        if next_start is None:
+            break
+        params["start"] = next_start
 
     # Post-filter
     canal_key = registry.field_key("deal", "Canal de Entrada") if canal is not None else None
@@ -354,29 +358,35 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
         group_by: Literal["nucleo", "canal", "owner", "portfolio", None] = None,
     ) -> dict:
         """
-        Compute close-rate and win-rate statistics for deals matching the filters.
+        Compute close-rate, win-rate, and (when `pipeline` is set) a full
+        per-stage FUNNEL for deals matching the filters.
 
         Use for diagnóstico estratégico: "qual a taxa de conversão do NDados
         no Outbound?", "como o CN João está convertendo em Educação?",
-        "win rate da PJ no Q1 vs Q2", "ganho/perda por canal".
+        "win rate da PJ no Q1 vs Q2", "qual a perda entre Proposta e
+        Negociação para portfólio IA?".
 
-        Returns aggregated counts and ratios over the deal set; can optionally
-        break down by núcleo / canal / owner / portfólio for comparative views.
-
-        v1 LIMITATION: cannot compute stage-to-stage transition rates (e.g.
-        "% que chegou de AT a Proposta") because there's no per-deal stage
-        history. Only terminal ratios are available — won/(won+lost) and won/total.
+        FUNNEL auto-computed when `pipeline` is provided. For every stage of
+        the pipeline (in order_nr order), counts closed deals only:
+            count(X) = #won + #lost where current stage's order_nr ≥ X.order_nr
+        Conversion rate stage(i) → stage(i+1) = count[i+1] / count[i].
+        Open deals are excluded (poluem a análise). Uses the already-paginated
+        deals list — no extra API calls.
 
         Args:
-            nucleo, portfolio, canal, setor, cn_name, pipeline, start_date,
-                end_date: Same vocabulary as list_deals_with_filters.
+            nucleo, portfolio, canal, setor, funcionarios, origem, suborigem,
+                cn_name, hunter, sdr, pipeline, start_date, end_date,
+                won_start_date, won_end_date, lost_start_date, lost_end_date,
+                min_value, max_value: Same vocabulary as list_deals_with_filters.
             group_by: "nucleo" | "canal" | "owner" | "portfolio" | None.
                 When set, adds "by_group" breakdown alongside "overall".
 
         Returns:
             Dict with "overall" {total, open, won, lost, deleted, close_rate,
             win_rate, total_value_won, total_value_lost}, plus optional
-            "by_group" with same shape per group key.
+            "by_group" with same shape per group key, plus optional
+            "funnel" {stages: [{name, count}], transitions: [{from, to, rate}]}
+            when `pipeline` is provided.
         """
         await registry.ensure_loaded()
 
@@ -406,6 +416,74 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
 
         overall = _compute_stats(deals)
 
+        # Multi-step funnel — auto-computed whenever `pipeline` is set.
+        # Stages are pipeline-scoped, so without a pipeline filter the funnel
+        # is ambiguous. When pipeline is provided we get all of its stages
+        # (ordered by order_nr) and compute the per-stage closed-deal count.
+        #
+        # Per-stage count formula (closed deals only — open polui):
+        #   count(X) = #won + #lost where current stage's order_nr >= X.order_nr
+        #
+        # Won deals always count for every stage (they reached the end of the
+        # funnel regardless of where stage_id was last set).
+        # Source data: the already-paginated `deals` above (all_not_deleted,
+        # full pagination, no cap). Filtering won/lost in memory avoids any
+        # extra API round-trips.
+        funnel: dict | None = None
+        if pipeline is not None:
+            try:
+                funnel_pipeline_id = _resolve_pipeline(registry, pipeline)
+            except KeyError as e:
+                raise ValueError(str(e)) from e
+
+            # All stages of the pipeline, ordered ascending by order_nr
+            pipeline_stage_metas = sorted(
+                (
+                    (sid, meta)
+                    for sid, meta in registry._stages.items()
+                    if meta["pipeline_id"] == funnel_pipeline_id
+                ),
+                key=lambda x: int(x[1]["order_nr"]),
+            )
+
+            # Split closed deals once (faster than per-stage rescans)
+            won_deals = [d for d in deals if d.get("status") == "won"]
+            lost_deals = [d for d in deals if d.get("status") == "lost"]
+            won_count = len(won_deals)
+
+            stage_counts: list[dict] = []
+            for _sid, meta in pipeline_stage_metas:
+                order = int(meta["order_nr"])
+                lost_at_or_past = 0
+                for d in lost_deals:
+                    dsid = _to_int(d.get("stage_id"))
+                    if dsid is None:
+                        continue
+                    dmeta = registry._stages.get(dsid)
+                    if dmeta is None:
+                        continue
+                    if dmeta["pipeline_id"] != funnel_pipeline_id:
+                        continue
+                    if int(dmeta["order_nr"]) >= order:
+                        lost_at_or_past += 1
+                stage_counts.append(
+                    {"name": meta["name"], "count": won_count + lost_at_or_past}
+                )
+
+            transitions: list[dict] = []
+            for i in range(1, len(stage_counts)):
+                prev = stage_counts[i - 1]["count"]
+                curr = stage_counts[i]["count"]
+                transitions.append(
+                    {
+                        "from": stage_counts[i - 1]["name"],
+                        "to": stage_counts[i]["name"],
+                        "rate": (curr / prev) if prev > 0 else None,
+                    }
+                )
+
+            funnel = {"stages": stage_counts, "transitions": transitions}
+
         filters_applied = {
             "nucleo": nucleo,
             "portfolio": portfolio,
@@ -432,8 +510,14 @@ def register(mcp: FastMCP, registry: FieldsRegistry) -> None:
             "overall": overall,
             "group_by": group_by,
             "filters_applied": filters_applied,
-            "v1_note": "Stage-to-stage transition rates not available in v1 (no event store).",
+            "v1_note": (
+                "funnel (quando presente) é snapshot: count(X) = won + lost "
+                "cuja stage atual tem order_nr ≥ X. Open é excluído."
+            ),
         }
+
+        if funnel is not None:
+            result["funnel"] = funnel
 
         if group_by is not None:
             grouped: dict[str, list[dict]] = {}
